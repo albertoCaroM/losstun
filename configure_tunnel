@@ -1,0 +1,282 @@
+#!/usr/bin/perl -Ww
+
+use 5.010;
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+chdir dirname(__FILE__);
+
+my $help_text=
+"❌ Usage: $0 [--email] [--domain] [--staging]
+
+Asi tambien podemos ver como queda
+
+Cuando usamos varias 
+
+
+End without errors🎉";
+
+
+GetOptions(
+
+            'p|ports=i{2}' => \my @ports,
+            'd|domain=s@' => \my @domains,
+            'e|email=s' => \my $email,
+            's|stagging' => \my $staging,
+            'f|force' => \my $force,
+            'c|certificate_name=s' => \my $certificate_name,
+            'h|help' => \my $help,
+            'm|man' => \my $man,
+            'v|verbose' => \my $verbose,
+            ) or pod2usage(2);
+pod2usage(1) if $help;
+pod2usage(-exitval => 0, -verbose => 2) if $man;
+@ports=(9000,9010) unless @ports;
+$certificate_name="losstun" unless $certificate_name;
+
+
+die  "❌ certificate name must only contains letter, numbers and underscore " unless $certificate_name =~ /^[a-zA-Z0-9_]+$/;
+
+
+die "❌ you should provide at least one domain" unless @domains;
+die "❌ you should provide an email" unless $email;
+
+die "❌ first number  must be bigget than second one "  if ($ports[1] <= $ports[0]);
+die "❌ the second number must be smaller than 65536"  if ($ports[1] >65535);
+
+
+sub run {
+    my $cmd = shift;
+    say "🔥 executing: $cmd" if $verbose;
+    my $out = `$cmd`;
+    say "➡️  $out" if $verbose; 
+    say " WITH EXIT $?" if $verbose; 
+}
+
+# check if exist docker-compose executable in path
+run "which  docker-compose";
+die "❌ docker-compose not found " if ( $? != 0);
+
+# check if exist curl executable in path
+run "which  curl";
+die "❌ curl not found " if ( $? != 0);
+
+
+my $rsa_key_size=4096;
+
+use Cwd qw();
+my $pwd = Cwd::abs_path();
+
+my $data_path="${pwd}/data";
+my $data_certbot_path="${data_path}/certbot";
+my $data_nginx_path="${data_path}/nginx";
+
+
+if ( -d "$data_certbot_path/conf" && ! $force ){
+ say "⚠️  folder $data_certbot_path/conf exists, use flag force if you want rewrite their content and the certificate.";
+ exit 1;
+}
+
+if ( -d "$data_certbot_path/www" && ! $force ){
+ say "⚠️  folder $data_certbot_path/www exists, use flag force if you want rewrite their content and the certificate.";
+ exit 1;
+ }
+
+my $cert_folder = "/etc/letsencrypt/live/$certificate_name";
+my $cert_folder_no_docker = "$data_certbot_path/conf/live/$certificate_name";
+
+if ( -d "$cert_folder_no_docker" && ! $force ){
+ say "⚠️  folder $cert_folder exists, use flag force if you want rewrite their content and the certificate.";
+ exit 1;
+}
+run "install -d  $cert_folder_no_docker";
+
+if ( -e "$data_certbot_path/conf/options-ssl-nginx.conf" && ! $force) {
+ say "⚠️  file $data_certbot_path/conf/options-ssl-nginx.conf exists, use flag force if you want rewrite their content.";
+ exit 1;
+}
+
+if ( -e "$data_certbot_path/conf/ssl-dhparams.pem" && ! $force) {
+ say "⚠️  file $data_certbot_path/conf/ssl-dhparams.pem exists, use flag force if you want rewrite their content.";
+ exit 1;
+}
+ 
+
+run "install -d  $data_certbot_path/conf/";
+run "install -d  $data_certbot_path/www/";
+run "curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf > $data_certbot_path/conf/options-ssl-nginx.conf";
+run "curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot/certbot/ssl-dhparams.pem > $data_certbot_path/conf/ssl-dhparams.pem";
+
+
+say "ℹ️  Creating dummy certificate $certificate_name for @domains ...";
+my $cmd= ""
+." docker-compose run --rm --entrypoint \""
+." openssl req -x509 -nodes -newkey rsa:$rsa_key_size -days 1 "
+." -keyout \'$cert_folder/privkey.pem\' "
+." -out \'$cert_folder/fullchain.pem\' "
+." -subj \'/CN=localhost\'\" certbot ";
+run $cmd;
+say "$?";
+die "❌ no se ha podido crear el certificado correctamente " if $?;
+
+
+
+
+
+say "ℹ️  Configuring nginx for @domains";
+my $nginx_conf_path = "$data_nginx_path/app.conf";
+open(my $nginx_conf, ">",  "$nginx_conf_path") or die "Can't open $nginx_conf_path, unable to save nginx configuration: errno $!";
+my @named_tunnel_domains;
+my @full_named_tunnel_domains;
+@ports = $ports[0] .. $ports[1];
+foreach my $domain (@domains)
+{
+    push @named_tunnel_domains, "$domain";
+}
+
+foreach my $port (@ports) {
+  for (@named_tunnel_domains){
+   my $full_domain = "$port.$_";
+   push @full_named_tunnel_domains,$full_domain;
+   print  $nginx_conf "
+server {
+    listen 443 ssl http2;
+    server_name   $full_domain;
+    server_tokens off;
+
+    ssl_certificate $cert_folder/fullchain.pem;
+    ssl_certificate_key $cert_folder/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+
+    location / {
+        proxy_pass   http://127.0.0.1:$port;
+        proxy_set_header    Host                \$http_host;
+        proxy_set_header    X-Real-IP           \$remote_addr;
+        proxy_set_header    X-Forwarded-For     \$proxy_add_x_forwarded_for;
+
+    }
+}
+
+server {
+    listen 80;
+    server_name $full_domain;
+    server_tokens off;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+";
+  }
+}
+
+
+# print  $nginx_conf '
+
+# server {
+#     listen 80;
+#     server_name _;
+#     server_tokens off;
+
+#     location /.well-known/acme-challenge/ {
+#         root /var/www/certbot;
+#     }
+
+#     location / {
+#         return 301 https://$host$request_uri;
+#     }
+# }
+
+# ';
+close $nginx_conf or die "❌ unable to close nginx configuration";
+
+
+
+say "ℹ️  Starting nginx...";
+run "docker-compose up --force-recreate -d nginx";
+
+ say "ℹ️  Deleting dummy certificate for @domains ...";
+ $cmd = ""
+ . "docker-compose run --rm  --entrypoint \"rm -rf /etc/letsencrypt/live/$certificate_name  "
+ . " && rm -rf /etc/letsencrypt/archive/$certificate_name "
+ . " && rm -rf /etc/letsencrypt/renewal/$certificate_name.conf\""
+ . " certbot ";
+ run $cmd;
+ die "❌ no se ha podido eliminar el certificado dummy correctamente" if $?;
+
+
+my $ email_arg = defined $email? " --email $email ": " --register-unsafely-without-email";
+my $staging_arg = defined $staging? " --staging " : " " ;
+my $domains_arg = " -d " . join(",", @full_named_tunnel_domains);
+say "ℹ️  Requesting Let's Encrypt certificate for $domains_arg ...";
+$cmd = ""
+  . " docker-compose run --rm --entrypoint   \""
+  . " certbot certonly -v --webroot  -w /var/www/certbot "
+  . " --keep  --no-eff-email --duplicate --expand "
+  . " --cert-name $certificate_name "
+  . " $email_arg"
+  . " $staging_arg"
+  . " $domains_arg"
+  . " --non-interactive"
+  . " --rsa-key-size $rsa_key_size "
+  . " --agree-tos "
+  . " --force-renewal\"" 
+  . " certbot ";
+
+   run "$cmd";
+die "❌ no se ha podido solicitar el certificado dummy correctamente" if $?;
+
+say "ℹ️  Reloading nginx ...";
+run "docker-compose exec -T  nginx nginx -s reload";
+die "❌ no se ha podido recargar nginx" if $?;
+say "🎉 configuracion creada"
+
+__END__
+
+
+=head1 ./configure_tunnel
+
+./configure_tunnel - configure nginx and get certificates to use with localsshtunnel
+
+=head1 SYNOPSIS
+
+./configure_tunnel [options] 
+
+ Options:
+   -h | -help                                     brief help message.
+   -m | -man                                      full documentation.
+   -p number1 number2 | --ports number1 number2   port range [numbers must be an integer  a number 2 muest be smaller than 65535 and bigger than number1.
+   -e email | --email email                       email to request certificate, on let's Encrypt.
+   -s | --stagging                                flag to use let's encrypt stagin and avoid limitations problems or similar. 
+   -f | --force                                   flag to force write certificate configuration, eventhought it means rewrite existing files'
+   -c name | --certificate name                   name to identify the certificate 
+   -v | --verbose                                 enable verbose mode
+   
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+B<This program> will read the given input file(s) and do something
+useful with the contents thereof.
+
+=cut
